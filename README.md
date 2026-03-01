@@ -4,6 +4,34 @@ A modular, production-ready Python trading bot that combines **LSTM price predic
 
 ---
 
+## 📸 Screenshots
+
+### Bot Startup — Paper Trading Mode
+![Bot Startup Log](docs/screenshots/01_bot_startup.png)
+*Coloured terminal output showing the full startup sequence: data load, LSTM training, and first trade signal.*
+
+### Backtest Equity Curve
+![Backtest Equity Curve](docs/screenshots/02_backtest_equity_curve.png)
+*Walk-forward backtest equity curve with drawdown panel and key performance metrics (Sharpe, Sortino, Win Rate, etc.).*
+
+### Live Signal Chart — BTC/USDT 1H
+![Live Signal Chart](docs/screenshots/03_signal_chart.png)
+*Real-time candlestick chart showing BUY/SELL signal arrows, EMA overlays, volume bars, and RSI indicator.*
+
+### Module Architecture Diagram
+![Architecture Diagram](docs/screenshots/04_architecture.png)
+*Data flow from CCXT/CoinGecko through Data Manager → LSTM Predictor → Strategy Engine → Order Execution.*
+
+### Trade Journal
+![Trade Journal](docs/screenshots/05_trade_log.png)
+*CSV-backed trade journal showing entry/exit prices, P&L, duration, and signal source for recent trades.*
+
+### Portfolio Status Dashboard
+![Portfolio Dashboard](docs/screenshots/06_portfolio_dashboard.png)
+*Live dashboard with portfolio value, open positions, strategy breakdown, mini equity curve, and risk utilisation bars.*
+
+---
+
 ## ⚠️ IMPORTANT DISCLAIMERS
 
 > **Trading bots carry significant financial risk.** This software is provided for educational purposes. Never trade with funds you cannot afford to lose.
