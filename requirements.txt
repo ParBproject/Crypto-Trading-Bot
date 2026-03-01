@@ -1,0 +1,46 @@
+# ============================================================
+# Crypto Trading Bot — Python Dependencies
+# Python >= 3.10 required
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# ─── Exchange & Market Data ──────────────────────────────────
+ccxt>=4.2.0                 # Unified crypto exchange API (100+ exchanges)
+pycoingecko>=3.1.0          # CoinGecko market data API (free tier)
+requests>=2.31.0
+
+# ─── Data Processing ─────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+
+# ─── Technical Indicators ────────────────────────────────────
+pandas-ta>=0.3.14b          # RSI, MACD, ATR, Bollinger Bands, etc.
+
+# ─── Machine Learning ────────────────────────────────────────
+tensorflow>=2.15.0          # LSTM model (use torch if preferred)
+scikit-learn>=1.4.0         # Preprocessing, metrics
+
+# ─── Configuration & Environment ─────────────────────────────
+python-dotenv>=1.0.0        # Load .env files
+PyYAML>=6.0.1               # YAML config parsing
+
+# ─── Logging & Monitoring ────────────────────────────────────
+colorlog>=6.8.0             # Colored console logging
+
+# ─── Notifications (optional) ────────────────────────────────
+python-telegram-bot>=20.7   # Telegram alerts
+aiohttp>=3.9.0              # Async HTTP for Discord webhooks
+
+# ─── Backtesting ─────────────────────────────────────────────
+# vectorbt>=0.26.1           # Optional: advanced backtesting
+# backtrader>=1.9.78         # Optional: event-driven backtesting
+
+# ─── Utilities ───────────────────────────────────────────────
+schedule>=1.2.1             # Job scheduling
+tabulate>=0.9.0             # Pretty-print tables in logs
+tqdm>=4.66.0                # Progress bars for training
+
+# ─── Dev / Testing ───────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.23.0

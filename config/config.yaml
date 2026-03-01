@@ -1,0 +1,88 @@
+# ============================================================
+# Crypto Trading Bot — Master Configuration
+# ============================================================
+# Copy .env.example to .env and fill in your API keys.
+# All secrets (API keys) must live in .env, NOT here.
+
+# ─── Exchange ────────────────────────────────────────────────
+exchange:
+  name: "binance"          # Any ccxt-supported exchange id
+  sandbox: true            # true = testnet/paper mode (SAFE DEFAULT)
+  rate_limit_ms: 500       # ms between API calls
+
+# ─── Trading Universe ────────────────────────────────────────
+trading:
+  pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+  base_currency: "USDT"
+  timeframe: "1h"          # 1m, 5m, 15m, 1h, 4h, 1d
+  loop_interval_sec: 60    # How often the main loop fires
+  mode: "paper"            # paper | live | backtest
+
+# ─── Data ────────────────────────────────────────────────────
+data:
+  lookback_candles: 500    # Historical candles to load on start
+  coingecko_vs_currency: "usd"
+  cache_dir: "data/"
+
+# ─── LSTM Model ──────────────────────────────────────────────
+model:
+  sequence_length: 60      # Lookback window (candles)
+  forecast_horizon: 1      # Candles ahead to predict
+  lstm_units: [64, 64, 32] # Units per LSTM layer
+  dropout: 0.2
+  epochs: 100
+  batch_size: 32
+  validation_split: 0.15
+  early_stopping_patience: 10
+  learning_rate: 0.001
+  model_dir: "models/"
+  retrain_interval_hours: 24  # Retrain every N hours
+
+# ─── Strategy ────────────────────────────────────────────────
+strategy:
+  # LSTM signal thresholds (predicted % change vs current price)
+  long_threshold_pct: 1.5    # Predict +1.5% → consider long
+  short_threshold_pct: -1.5  # Predict -1.5% → consider short
+  # Technical indicator filters
+  rsi_oversold: 35
+  rsi_overbought: 65
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  volume_surge_multiplier: 1.5  # Volume must be > 1.5x average
+  atr_period: 14
+
+# ─── Risk Management ─────────────────────────────────────────
+risk:
+  max_risk_per_trade_pct: 1.5    # % of account risked per trade
+  atr_stop_multiplier: 2.5       # Stop = entry ± 2.5 * ATR
+  reward_risk_ratio: 2.5         # Take profit at 2.5 × risk
+  max_drawdown_pct: 12.0         # Pause bot if drawdown > 12%
+  max_single_asset_exposure_pct: 25.0  # Max % of account in 1 asset
+  max_open_trades: 3
+  use_kelly_criterion: false     # If true, uses Kelly sizing (aggressive)
+  kelly_fraction: 0.25           # Fractional Kelly (safer)
+
+# ─── Logging & Notifications ─────────────────────────────────
+logging:
+  level: "INFO"            # DEBUG | INFO | WARNING | ERROR
+  log_dir: "logs/"
+  trade_log_file: "logs/trades.csv"
+  max_log_size_mb: 10
+  backup_count: 5
+
+notifications:
+  telegram_enabled: false  # Set to true + fill .env for Telegram alerts
+  discord_enabled: false
+  notify_on: ["trade_open", "trade_close", "stop_loss", "drawdown_alert"]
+
+# ─── Backtesting ─────────────────────────────────────────────
+backtest:
+  start_date: "2023-01-01"
+  end_date: "2024-01-01"
+  initial_capital: 10000.0
+  commission_pct: 0.1      # 0.1% maker/taker fee
+  slippage_pct: 0.05       # Simulated slippage
