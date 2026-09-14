@@ -87,6 +87,8 @@ class PaperTradeEngine:
         Simulate a market order fill.
 
         Applies slippage: buys fill slightly above, sells slightly below.
+        A buy covers an existing short before it can create a long; a sell
+        reduces an existing long before it can create a short.
         """
         slip = self.SLIPPAGE_PCT
         if side == "buy":
@@ -94,52 +96,128 @@ class PaperTradeEngine:
         else:
             fill_price = current_price * (1 - slip)
 
-        cost = quantity * fill_price
-        commission = cost * self.COMMISSION_PCT
-
         self.order_counter += 1
         order_id = f"PAPER-{self.order_counter:06d}"
+        fill_time = datetime.utcnow()
+        existing = self.positions.get(symbol)
 
-        if side == "buy":
+        if side == "buy" and existing and existing.get("side") == "sell":
+            # Cover some or all of an existing short.
+            filled_qty = min(quantity, existing["quantity"])
+            cost = filled_qty * fill_price
+            commission = cost * self.COMMISSION_PCT
             if cost + commission > self.cash:
                 return OrderResult(
                     success=False,
                     order_id=None,
                     symbol=symbol,
                     side=side,
-                    quantity=quantity,
+                    quantity=filled_qty,
                     fill_price=fill_price,
-                    fill_time=datetime.utcnow(),
+                    fill_time=fill_time,
                     cost_usd=cost,
                     commission_usd=commission,
                     mode="paper",
-                    error=f"Insufficient cash: need ${cost+commission:.2f}, have ${self.cash:.2f}",
+                    error=(
+                        f"Insufficient cash: need ${cost+commission:.2f}, "
+                        f"have ${self.cash:.2f}"
+                    ),
                 )
-            self.cash -= (cost + commission)
-            self.positions[symbol] = {
-                "quantity": quantity,
-                "entry_price": fill_price,
-                "entry_time": datetime.utcnow(),
-                "side": side,
-            }
+
+            self.cash -= cost + commission
+            remaining = existing["quantity"] - filled_qty
+            if remaining > 1e-12:
+                existing["quantity"] = remaining
+            else:
+                del self.positions[symbol]
             self.logger.info(
-                f"📄 PAPER BUY  {quantity:.6f} {symbol} @ {fill_price:.4f} "
+                f"📄 PAPER COVER {filled_qty:.6f} {symbol} @ {fill_price:.4f} "
+                f"| Cost: ${cost:.2f} | Cash: ${self.cash:.2f}"
+            )
+
+        elif side == "buy":
+            # Open (or add to) a long position.
+            filled_qty = quantity
+            cost = filled_qty * fill_price
+            commission = cost * self.COMMISSION_PCT
+            if cost + commission > self.cash:
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    symbol=symbol,
+                    side=side,
+                    quantity=filled_qty,
+                    fill_price=fill_price,
+                    fill_time=fill_time,
+                    cost_usd=cost,
+                    commission_usd=commission,
+                    mode="paper",
+                    error=(
+                        f"Insufficient cash: need ${cost+commission:.2f}, "
+                        f"have ${self.cash:.2f}"
+                    ),
+                )
+
+            self.cash -= cost + commission
+            if existing and existing.get("side") == "buy":
+                old_qty = existing["quantity"]
+                total_qty = old_qty + filled_qty
+                existing["entry_price"] = (
+                    existing["entry_price"] * old_qty + fill_price * filled_qty
+                ) / total_qty
+                existing["quantity"] = total_qty
+            else:
+                self.positions[symbol] = {
+                    "quantity": filled_qty,
+                    "entry_price": fill_price,
+                    "entry_time": fill_time,
+                    "side": "buy",
+                }
+            self.logger.info(
+                f"📄 PAPER BUY  {filled_qty:.6f} {symbol} @ {fill_price:.4f} "
                 f"| Cost: ${cost:.2f} | Cash left: ${self.cash:.2f}"
             )
 
-        else:  # sell
-            existing = self.positions.get(symbol, {})
-            sell_qty = min(quantity, existing.get("quantity", 0))
-            if sell_qty <= 0:
-                # Short selling (if exchange supports)
-                sell_qty = quantity
-
-            proceeds = sell_qty * fill_price - commission
+        elif existing and existing.get("side") == "buy":
+            # Sell some or all of an existing long.
+            filled_qty = min(quantity, existing["quantity"])
+            cost = filled_qty * fill_price
+            commission = cost * self.COMMISSION_PCT
+            proceeds = cost - commission
             self.cash += proceeds
-            if symbol in self.positions:
+            remaining = existing["quantity"] - filled_qty
+            if remaining > 1e-12:
+                existing["quantity"] = remaining
+            else:
                 del self.positions[symbol]
             self.logger.info(
-                f"📄 PAPER SELL {sell_qty:.6f} {symbol} @ {fill_price:.4f} "
+                f"📄 PAPER SELL {filled_qty:.6f} {symbol} @ {fill_price:.4f} "
+                f"| Proceeds: ${proceeds:.2f} | Cash: ${self.cash:.2f}"
+            )
+
+        else:
+            # Open (or add to) a short position.
+            filled_qty = quantity
+            cost = filled_qty * fill_price
+            commission = cost * self.COMMISSION_PCT
+            proceeds = cost - commission
+            self.cash += proceeds
+            if existing and existing.get("side") == "sell":
+                old_qty = existing["quantity"]
+                total_qty = old_qty + filled_qty
+                existing["entry_price"] = (
+                    existing["entry_price"] * old_qty + fill_price * filled_qty
+                ) / total_qty
+                existing["quantity"] = total_qty
+            else:
+                self.positions[symbol] = {
+                    "quantity": filled_qty,
+                    "entry_price": fill_price,
+                    "entry_time": fill_time,
+                    "side": "sell",
+                }
+            self.logger.info(
+                f"📄 PAPER SHORT {filled_qty:.6f} {symbol} @ {fill_price:.4f} "
                 f"| Proceeds: ${proceeds:.2f} | Cash: ${self.cash:.2f}"
             )
 
@@ -148,9 +226,9 @@ class PaperTradeEngine:
             order_id=order_id,
             symbol=symbol,
             side=side,
-            quantity=quantity,
+            quantity=filled_qty,
             fill_price=fill_price,
-            fill_time=datetime.utcnow(),
+            fill_time=fill_time,
             cost_usd=cost,
             commission_usd=commission,
             mode="paper",
