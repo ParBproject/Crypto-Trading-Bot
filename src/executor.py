@@ -330,7 +330,8 @@ class OrderManager:
         result = self._place(params.symbol, side, params.quantity, current_price)
 
         if result.success:
-            # Update portfolio state
+            # Update portfolio state. current_capital represents account equity,
+            # so entering a position only reduces it by the transaction fee.
             self.portfolio.open_positions[params.symbol] = {
                 "side": side,
                 "quantity": params.quantity,
@@ -371,7 +372,8 @@ class OrderManager:
         result = self._place(symbol, close_side, quantity, current_price)
 
         if result.success:
-            # Realise P&L
+            # Realise P&L. Entry commission was deducted when the position opened;
+            # this P&L therefore includes only price movement and exit commission.
             entry = position["entry_price"]
             qty = position["quantity"]
             if position["side"] == "buy":
@@ -379,8 +381,9 @@ class OrderManager:
             else:
                 pnl = (entry - result.fill_price) * qty - result.commission_usd
 
-            self.portfolio.current_capital += result.cost_usd - result.commission_usd
-            self.portfolio.current_capital += pnl if position["side"] == "buy" else 0
+            # current_capital is equity, not cash. The position principal was never
+            # subtracted at entry, so adding exit notional here would double-count it.
+            self.portfolio.current_capital += pnl
             self.portfolio.update_peak()
 
             # Append to history
