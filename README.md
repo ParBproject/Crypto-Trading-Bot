@@ -1,5 +1,13 @@
 # Automated Cryptocurrency Trading Bot
 
+## For a data analyst application
+
+**Keep this off the first page of a data analyst resume.** It is a paper-trading research system. If you mention it, talk about the evaluation and the risk limits, and keep execution in paper mode in the story you tell.
+
+<p align="center"><img src="docs/screenshots/02_backtest_equity_curve.png" alt="Backtest equity curve" width="100%"></p>
+<p align="center"><img src="docs/screenshots/06_portfolio_dashboard.png" alt="Portfolio dashboard" width="100%"></p>
+<p align="center"><img src="docs/screenshots/05_trade_log.png" alt="Trade journal" width="100%"></p>
+
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](requirements.txt)
 [![ML](https://img.shields.io/badge/Model-LSTM-FF6F00?logo=tensorflow&logoColor=white)](train_model.py)
 [![Mode](https://img.shields.io/badge/Default-Paper_Trading-2ea44f)](config/config.yaml)
