@@ -19,7 +19,7 @@ The charts below come from one rules-only replay of committed Binance spot candl
 
 ## Features
 
-- CCXT candles for any exchange id in config, plus a CoinGecko fallback when the exchange client returns nothing
+- CCXT candles for any exchange id in config, with paged history for the backtest dates, a Binance archive fallback, and a CoinGecko OHLC fallback
 - Indicator pipeline that uses `pandas_ta` when it is installed and a pure-pandas implementation otherwise
 - Optional stacked LSTM that outputs a percent-change forecast, with Monte Carlo dropout used as a confidence score
 - Hybrid entries (forecast plus RSI, MACD, volume, and EMA gates) and a rules-only fallback when no forecast is available
@@ -58,7 +58,8 @@ flowchart LR
 | Ending realized equity | $10,000.00 (0.00%) |
 | Buy and hold, same bars | $16,177.30 (+61.77%), close from 57,844 to 93,576 |
 | Max drawdown of realized equity | 0.00% |
-| Sharpe | 0.000 |
+| Sharpe | 0.0 |
+| Sortino | 0.0 |
 
 The rule set stayed in cash. On the 2,636 test bars, RSI was oversold 6.68% of the time, MACD was bullish 47.57% of the time, and the close was above EMA-20 56.68% of the time. All three were true together on **0** bars, so the risk manager never sized an order.
 
@@ -101,12 +102,15 @@ The full dependency list adds the exchange client, TensorFlow, and the optional 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
+# config/config.yaml is already in the repo (paper mode, sandbox).
+# If it is missing, main.py asks you to copy the template:
+# cp config/config.yaml.example config/config.yaml
 python main.py --mode paper
 ```
 
 `main.py` repeats until you stop the process. Live orders start only after `--mode live` and the confirmation prompt. Keep the sandbox flag in `config/config.yaml` until the exchange path has been checked with testnet credentials.
 
-`python backtest.py` is the entry point that fetches candles itself. The committed config loads 500 hourly bars and then keeps only 1 Jan 2023 through 1 Jan 2024, so a successful fetch still fails the length check. The sample script above is the run that finishes offline.
+`python backtest.py` loads the committed window, 1 Jan 2023 through 1 Jan 2024, instead of the 500-bar live lookback. It reads public historical candles for that range. When the exchange REST call fails, Binance symbols fall back to the monthly archive on data.binance.vision. `backtest.commission_pct` is a percent (`0.1` means 0.1% per fill), charged once on entry and once on exit. If TensorFlow is not installed, that command continues with the rules-only strategy.
 
 ## Tests
 
@@ -114,7 +118,7 @@ python main.py --mode paper
 python -m pytest
 ```
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that suite on every push and pull request, on Python 3.11, after a Ruff syntax check and `compileall`. The tests follow a paper close of a long and of a short: account equity changes by price PnL and the exit commission, and the exit notional is left out of that sum.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that suite on every push and pull request, on Python 3.11, after a Ruff syntax check and `compileall`. The tests cover paper closes, backtest entry and exit fees, the configured history window, CoinGecko OHLC columns, Sortino on a flat curve, and the example config.
 
 ## Project structure
 
@@ -125,6 +129,7 @@ Crypto-Trading-Bot/
 ├── train_model.py               # standalone LSTM training
 ├── scripts/reproduce_backtest.py
 ├── config/config.yaml
+├── config/config.yaml.example   # paper/sandbox template, no secrets
 ├── data/sample/                 # 2024 BTC/USDT hourly candles
 ├── docs/results/                # metrics, trades, charts
 ├── src/
@@ -135,7 +140,7 @@ Crypto-Trading-Bot/
 │   ├── risk_manager.py
 │   ├── executor.py
 │   └── logger.py
-├── tests/test_executor.py
+├── tests/
 ├── .github/workflows/ci.yml
 ├── requirements.txt
 └── LICENSE
@@ -143,13 +148,12 @@ Crypto-Trading-Bot/
 
 ## Limitations and next steps
 
-- The published run is one pair, hourly spot candles for 2024, rules only, and only the last 30% of the file. Treat it as a baseline check: the gates never opened while the test-window price rose 61.77%.
+- The rules-only long requires three conditions on the same bar: RSI below 35, MACD above its signal, and close above EMA-20. On this test window those three never occurred together (0 of 2,636 bars), so the backtest opened no trades while the test-window price rose 61.77%.
+- The published run is one pair, hourly spot candles for 2024, rules only, and only the last 30% of the file. Entry and exit rules were left as they are.
 - Equity in the backtest updates when a trade closes. Open positions are carried at entry, so the curve is realized equity.
-- Backtest commissions are hardcoded on `BacktestEngine` and are a different formula from the paper `OrderManager` path the tests cover. The `backtest.commission_pct` value in config is unread.
-- With no down bars, `compute_sortino_ratio` divides by a `1e-9` fallback. On this run it returned `-534217.304`. Sharpe on the same flat curve is 0. The table above omits that Sortino figure; `metrics.json` keeps it so the engine output stays complete.
-- The default client targets Binance sandbox. Fetching candles from this environment returned HTTP 451 from `testnet.binance.vision`. When CCXT fails, the CoinGecko fallback frame has close and volume only, while the indicator code still reads high and low.
-- `python main.py` tells you to copy `config/config.yaml.example` if the config file is missing. The repo ships `config/config.yaml` and does not include that example file.
-- Next steps worth doing before any performance claim: page historical candles so `backtest.py` can cover the dates in config, mark open positions to market, use one fee implementation, and score an LSTM forecast against buy-and-hold on this fixed file.
+- Sharpe and Sortino are both 0.0 on this run. Sortino stays 0 unless at least two equity returns are negative, which is this flat curve.
+- Order routing still follows `exchange.sandbox`. The backtest history request uses public candles, with the Binance monthly archive as a fallback when the REST call fails.
+- Next step worth doing before any performance claim: mark open positions to market, and score an LSTM forecast against buy-and-hold on this fixed file.
 
 This is a research project. Paper mode is the path the tests and the sample run cover. Nothing here is a recommendation to trade.
 

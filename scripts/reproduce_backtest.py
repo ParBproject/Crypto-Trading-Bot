@@ -262,8 +262,7 @@ def main() -> None:
         "Strategy return is realized equity from BacktestEngine with use_ml=False. "
         "Open positions are not marked to market between fills. "
         "Buy-and-hold is the test-window close scaled to the same starting capital. "
-        "Sortino on a flat curve is not a usable risk statistic: with no negative "
-        "returns the helper divides by a 1e-9 fallback."
+        "Sortino is 0 when fewer than two equity returns are negative."
     )
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

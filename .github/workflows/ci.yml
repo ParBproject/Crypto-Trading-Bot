@@ -25,7 +25,7 @@ jobs:
       - name: Install quality and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ruff pytest numpy pandas scikit-learn
+          python -m pip install ruff pytest numpy pandas scikit-learn pyyaml python-dotenv tabulate
 
       - name: Check syntax and critical errors
         run: ruff check main.py backtest.py train_model.py src tests --select E9,F63,F7,F82

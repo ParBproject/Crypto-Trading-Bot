@@ -452,13 +452,21 @@ class RiskManager:
         """
         Sortino Ratio — like Sharpe but only penalises downside volatility.
         Better suited to crypto's asymmetric return distribution.
+
+        Returns 0 when downside deviation is undefined: an empty series, a
+        flat series, or fewer than two negative observations. That avoids
+        dividing by a stand-in standard deviation.
         """
         if returns.empty:
             return 0.0
+        downside = returns[returns < 0]
+        if len(downside) < 2:
+            return 0.0
+        downside_std = float(downside.std())
+        if not np.isfinite(downside_std) or downside_std == 0:
+            return 0.0
         rf_per_period = risk_free_rate / periods_per_year
         excess = returns - rf_per_period
-        downside = returns[returns < 0]
-        downside_std = downside.std() if len(downside) > 1 else 1e-9
         return float((excess.mean() / downside_std) * np.sqrt(periods_per_year))
 
     @staticmethod

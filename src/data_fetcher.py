@@ -54,6 +54,165 @@ from src.logger import get_logger
 # ─────────────────────────────────────────────────────────────
 
 OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+OHLCV_REQUIRED = ("open", "high", "low", "close", "volume")
+
+TIMEFRAME_MS = {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "1h": 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+}
+
+
+def ohlcv_frame_from_rows(raw: list) -> pd.DataFrame:
+    """Normalise raw [ms, open, high, low, close, volume] rows."""
+    if not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw, columns=OHLCV_COLUMNS)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    df = df.astype(float)
+    df.sort_index(inplace=True)
+    return df
+
+
+def paginate_ohlcv(
+    fetch_page,
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+    page_limit: int = 1000,
+) -> pd.DataFrame:
+    """Walk `fetch_page(since, limit)` forward until `until_ms`.
+
+    Exchanges cap a single OHLCV response (Binance: 1000 rows). A backtest
+    window such as a calendar year of hourly bars has to be requested in pages.
+    """
+    step = TIMEFRAME_MS.get(timeframe)
+    if step is None:
+        supported = ", ".join(TIMEFRAME_MS)
+        raise ValueError(
+            f"Unsupported timeframe '{timeframe}' for a ranged candle fetch. "
+            f"Use one of: {supported}."
+        )
+
+    frames = []
+    cursor = int(since_ms)
+    until_ms = int(until_ms)
+    for _ in range(20_000):
+        if cursor > until_ms:
+            break
+        raw = fetch_page(since=cursor, limit=page_limit)
+        if not raw:
+            break
+        batch = ohlcv_frame_from_rows(raw)
+        if batch.empty:
+            break
+        frames.append(batch)
+        last_ms = int(batch.index[-1].timestamp() * 1000)
+        next_cursor = last_ms + step
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        if len(batch) < page_limit:
+            break
+
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    start = pd.to_datetime(since_ms, unit="ms", utc=True)
+    end = pd.to_datetime(until_ms, unit="ms", utc=True)
+    return df.loc[(df.index >= start) & (df.index <= end)]
+
+
+def _utc_timestamp(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def binance_vision_month_urls(
+    symbol: str,
+    timeframe: str,
+    start,
+    end,
+) -> list:
+    """Monthly Binance public-archive URLs covering `start` through `end`."""
+    pair = symbol.replace("/", "").upper()
+    start = _utc_timestamp(start)
+    end = _utc_timestamp(end)
+    cursor = pd.Timestamp(year=start.year, month=start.month, day=1, tz="UTC")
+    last = pd.Timestamp(year=end.year, month=end.month, day=1, tz="UTC")
+    urls = []
+    while cursor <= last:
+        stamp = f"{cursor.year}-{cursor.month:02d}"
+        name = f"{pair}-{timeframe}-{stamp}.zip"
+        urls.append(
+            "https://data.binance.vision/data/spot/monthly/klines/"
+            f"{pair}/{timeframe}/{name}"
+        )
+        if cursor.month == 12:
+            cursor = pd.Timestamp(year=cursor.year + 1, month=1, day=1, tz="UTC")
+        else:
+            cursor = pd.Timestamp(year=cursor.year, month=cursor.month + 1, day=1, tz="UTC")
+    return urls
+
+
+def parse_binance_kline_csv(text: str) -> pd.DataFrame:
+    """Parse a Binance kline CSV (optional header, ms or µs open time)."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("open_time"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        open_ms = int(float(parts[0]))
+        if open_ms > 10_000_000_000_000:
+            open_ms //= 1000
+        rows.append((open_ms, parts[1], parts[2], parts[3], parts[4], parts[5]))
+    return ohlcv_frame_from_rows(rows)
+
+
+def fetch_binance_vision_klines(symbol: str, timeframe: str, start, end) -> pd.DataFrame:
+    """Download spot klines from data.binance.vision for a closed window.
+
+    Used when the exchange REST API cannot serve the backtest range. The
+    archive is public historical data, not the testnet.
+    """
+    import io
+    import zipfile
+
+    import requests
+
+    start = _utc_timestamp(start)
+    end = _utc_timestamp(end)
+    logger = get_logger("BinanceArchive")
+    frames = []
+    for url in binance_vision_month_urls(symbol, timeframe, start, end):
+        try:
+            resp = requests.get(url, timeout=60)
+            if resp.status_code == 404:
+                logger.warning(f"No Binance archive file: {url}")
+                continue
+            resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                text = zf.read(zf.namelist()[0]).decode()
+            parsed = parse_binance_kline_csv(text)
+            if not parsed.empty:
+                frames.append(parsed)
+        except Exception as e:
+            logger.warning(f"Binance archive fetch failed ({url}): {e}")
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df.loc[(df.index >= start) & (df.index <= end)]
 
 # CoinGecko coin id mapping (symbol → coingecko id)
 COINGECKO_ID_MAP = {
@@ -162,6 +321,11 @@ class CCXTFetcher:
                 f"Exchange '{exchange_id}' initialised in LIVE mode — real funds at risk!"
             )
 
+        # Historical candles are public market data. Keep the sandboxed client
+        # for orders and use a keyless, non-sandbox client for backtest ranges.
+        self._market_exchange_class = exchange_class
+        self._public_exchange = None
+
     def _retry(self, fn, *args, **kwargs):
         """Execute fn with exponential backoff retries."""
         for attempt in range(self.MAX_RETRIES):
@@ -208,17 +372,43 @@ class CCXTFetcher:
             self.logger.warning(f"No OHLCV data returned for {symbol}")
             return pd.DataFrame()
 
-        df = pd.DataFrame(raw, columns=OHLCV_COLUMNS)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.set_index("timestamp", inplace=True)
-        df = df.astype(float)
-        df.sort_index(inplace=True)
+        df = ohlcv_frame_from_rows(raw)
 
         self.logger.debug(
             f"Fetched {len(df)} candles for {symbol} "
             f"({df.index[0]} → {df.index[-1]})"
         )
         return df
+
+    def _market_data_exchange(self):
+        """Keyless public client so historical klines are not read from testnet."""
+        if self._public_exchange is None:
+            self._public_exchange = self._market_exchange_class({
+                "enableRateLimit": True,
+                "rateLimit": self.rate_limit_ms,
+                "options": {"defaultType": "spot"},
+            })
+        return self._public_exchange
+
+    def fetch_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        since_ms: int,
+        until_ms: int,
+        page_limit: int = 1000,
+    ) -> pd.DataFrame:
+        """Fetch every candle from `since_ms` through `until_ms`."""
+        exchange = self._market_data_exchange()
+
+        def fetch_page(since, limit):
+            return self._retry(
+                exchange.fetch_ohlcv, symbol, timeframe, since=since, limit=limit
+            )
+
+        return paginate_ohlcv(
+            fetch_page, timeframe, since_ms, until_ms, page_limit=page_limit
+        )
 
     def fetch_ticker(self, symbol: str) -> dict:
         """Fetch current ticker (bid/ask/last/volume) for a symbol."""
@@ -276,41 +466,58 @@ class CoinGeckoFetcher:
         vs_currency: str = "usd",
     ) -> pd.DataFrame:
         """
-        Fetch historical daily OHLC + volume from CoinGecko.
+        Fetch OHLC from CoinGecko's OHLC endpoint.
+
+        The market-chart endpoint only returns close and volume. Indicator
+        code needs high and low, so this path refuses a close-only frame:
+        on failure it logs and returns an empty DataFrame.
+
+        CoinGecko OHLC does not include volume. The volume column is 0.0 so
+        downstream code still sees a complete OHLCV schema.
 
         Returns:
             DataFrame with DatetimeIndex, columns [open, high, low, close, volume]
         """
         coin_id = self.get_coin_id(symbol)
-        cache_key = f"cg_chart_{coin_id}_{days}_{vs_currency}"
+        days = max(int(days), 1)
+        cache_key = f"cg_ohlc_{coin_id}_{days}_{vs_currency}"
         cached = self.cache.get(cache_key, ttl_seconds=3600)
 
         if cached:
-            self.logger.debug(f"CoinGecko cache hit: {cache_key}")
-            data = cached
+            self.logger.debug(f"CoinGecko OHLC cache hit: {cache_key}")
+            ohlc = cached
         else:
-            self.logger.debug(f"Fetching CoinGecko market chart: {coin_id} {days}d")
+            self.logger.debug(f"Fetching CoinGecko OHLC: {coin_id} {days}d")
             try:
-                data = self.cg.get_coin_market_chart_by_id(
+                ohlc = self.cg.get_coin_ohlc_by_id(
                     id=coin_id, vs_currency=vs_currency, days=days
                 )
-                self.cache.set(cache_key, data)
             except Exception as e:
-                self.logger.error(f"CoinGecko fetch error: {e}")
+                self.logger.error(
+                    f"CoinGecko OHLC fetch failed for {coin_id}: {e}. "
+                    "Not substituting the close-only market chart, which has no high/low."
+                )
                 return pd.DataFrame()
+            if ohlc:
+                self.cache.set(cache_key, ohlc)
 
-        # Build DataFrame from prices and total_volumes
-        prices_df = pd.DataFrame(data.get("prices", []), columns=["ts", "close"])
-        volumes_df = pd.DataFrame(data.get("total_volumes", []), columns=["ts", "volume"])
+        if not ohlc:
+            self.logger.error(
+                f"CoinGecko returned no OHLC rows for {coin_id}. "
+                "Cannot build indicators without open, high, low, and close."
+            )
+            return pd.DataFrame()
 
-        df = prices_df.merge(volumes_df, on="ts", how="inner")
+        df = pd.DataFrame(ohlc, columns=["ts", "open", "high", "low", "close"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         df.set_index("ts", inplace=True)
         df.index.name = "timestamp"
         df = df.astype(float)
         df.sort_index(inplace=True)
+        # OHLC endpoint has no volume. Keep the column so indicator code can run.
+        df["volume"] = 0.0
 
-        self.logger.debug(f"CoinGecko returned {len(df)} rows for {coin_id}")
+        self.logger.debug(f"CoinGecko OHLC returned {len(df)} rows for {coin_id}")
         return df
 
     def fetch_global_metrics(self) -> dict:
@@ -364,6 +571,13 @@ class IndicatorCalculator:
         """
         if df.empty:
             return df
+
+        missing = [col for col in OHLCV_REQUIRED if col not in df.columns]
+        if missing:
+            raise ValueError(
+                "Cannot compute indicators without OHLCV columns "
+                f"{missing}. The data source did not provide them."
+            )
 
         df = df.copy()
 
@@ -529,17 +743,23 @@ class DataManager:
         timeframe: Optional[str] = None,
         limit: Optional[int] = None,
         add_indicators: bool = True,
+        since: Optional[object] = None,
+        until: Optional[object] = None,
     ) -> pd.DataFrame:
         """
         Fetch OHLCV candles for `symbol` and optionally enrich with indicators.
 
-        Priority: CCXT (live exchange) → CoinGecko (fallback for historical)
+        Priority for a recent window: CCXT → CoinGecko OHLC.
+        Priority for an explicit `since`/`until` range (backtests): public
+        CCXT history, then the Binance monthly archive, then CoinGecko OHLC.
 
         Args:
             symbol:         Trading pair e.g. "BTC/USDT"
             timeframe:      Override config timeframe (e.g. "1h")
-            limit:          Number of candles
+            limit:          Number of candles when no date range is set
             add_indicators: Whether to compute and append TA indicators
+            since:          Range start (inclusive). Used by the backtest window.
+            until:          Range end (inclusive).
 
         Returns:
             Enriched DataFrame ready for the prediction model
@@ -547,22 +767,10 @@ class DataManager:
         tf = timeframe or self.config.get("trading", {}).get("timeframe", "1h")
         lim = limit or self.config.get("data", {}).get("lookback_candles", 500)
 
-        df = pd.DataFrame()
-
-        # ── Primary: CCXT ─────────────────────────────────────
-        if self.ccxt_fetcher:
-            try:
-                df = self.ccxt_fetcher.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
-            except Exception as e:
-                self.logger.warning(f"CCXT fetch failed ({symbol}): {e}")
-
-        # ── Fallback: CoinGecko ───────────────────────────────
-        if df.empty and self.cg_fetcher:
-            self.logger.info(f"Falling back to CoinGecko for {symbol}")
-            try:
-                df = self.cg_fetcher.fetch_market_chart(symbol, days=min(lim, 365))
-            except Exception as e:
-                self.logger.error(f"CoinGecko fallback failed ({symbol}): {e}")
+        if since is not None or until is not None:
+            df = self._fetch_range(symbol, tf, since, until, lim)
+        else:
+            df = self._fetch_recent(symbol, tf, lim)
 
         if df.empty:
             self.logger.error(f"No data obtained for {symbol}")
@@ -575,6 +783,67 @@ class DataManager:
         # Cache in memory
         self._candle_store[symbol] = df
 
+        return df
+
+    def _fetch_recent(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        df = pd.DataFrame()
+        if self.ccxt_fetcher:
+            try:
+                df = self.ccxt_fetcher.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            except Exception as e:
+                self.logger.warning(f"CCXT fetch failed ({symbol}): {e}")
+
+        if df.empty and self.cg_fetcher:
+            self.logger.info(f"Falling back to CoinGecko OHLC for {symbol}")
+            try:
+                df = self.cg_fetcher.fetch_market_chart(symbol, days=min(limit, 365))
+            except Exception as e:
+                self.logger.error(f"CoinGecko fallback failed ({symbol}): {e}")
+        return df
+
+    def _fetch_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        since,
+        until,
+        lookback_limit: int,
+    ) -> pd.DataFrame:
+        """Fetch the configured backtest window, not the short live lookback."""
+        end = _utc_timestamp(until) if until is not None else pd.Timestamp.now(tz="UTC")
+        if since is not None:
+            start = _utc_timestamp(since)
+        else:
+            step = TIMEFRAME_MS.get(timeframe, 3_600_000)
+            start = end - pd.Timedelta(milliseconds=step * lookback_limit)
+
+        df = pd.DataFrame()
+        since_ms = int(start.timestamp() * 1000)
+        until_ms = int(end.timestamp() * 1000)
+
+        if self.ccxt_fetcher:
+            try:
+                df = self.ccxt_fetcher.fetch_ohlcv_range(
+                    symbol, timeframe, since_ms, until_ms
+                )
+            except Exception as e:
+                self.logger.warning(f"CCXT range fetch failed ({symbol}): {e}")
+
+        exchange_name = self.config.get("exchange", {}).get("name", "binance").lower()
+        if df.empty and exchange_name == "binance":
+            self.logger.info(f"Falling back to the Binance public kline archive for {symbol}")
+            try:
+                df = fetch_binance_vision_klines(symbol, timeframe, start, end)
+            except Exception as e:
+                self.logger.warning(f"Binance archive failed ({symbol}): {e}")
+
+        if df.empty and self.cg_fetcher:
+            span_days = max(int((end - start).total_seconds() / 86400) + 1, 1)
+            self.logger.info(f"Falling back to CoinGecko OHLC for {symbol}")
+            try:
+                df = self.cg_fetcher.fetch_market_chart(symbol, days=min(span_days, 365))
+            except Exception as e:
+                self.logger.error(f"CoinGecko fallback failed ({symbol}): {e}")
         return df
 
     def get_current_price(self, symbol: str) -> Optional[float]:

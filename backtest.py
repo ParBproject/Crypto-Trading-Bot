@@ -49,6 +49,59 @@ from src.logger import get_logger, TradeJournal
 # Backtest Engine
 # ─────────────────────────────────────────────────────────────
 
+def commission_rate_from_config(config: dict) -> float:
+    """Return the per-fill commission as a fraction.
+
+    ``backtest.commission_pct`` is a percent: 0.1 means 0.1% (rate 0.001),
+    matching the comment in config.yaml. Entry and exit each pay this once.
+    """
+    pct = float((config.get("backtest") or {}).get("commission_pct", 0.1))
+    if pct < 0:
+        raise ValueError("backtest.commission_pct must be >= 0")
+    return pct / 100.0
+
+
+def backtest_window(config: dict) -> tuple:
+    """Inclusive UTC bounds from ``backtest.start_date`` / ``end_date``."""
+    bt = config.get("backtest") or {}
+
+    def _ts(value):
+        if not value:
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    return _ts(bt.get("start_date")), _ts(bt.get("end_date"))
+
+
+def clip_to_window(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df
+    if start is not None:
+        out = out[out.index >= start]
+    if end is not None:
+        out = out[out.index <= end]
+    return out
+
+
+def load_backtest_frame(dm: DataManager, config: dict, pair: str) -> pd.DataFrame:
+    """Load candles for the configured window.
+
+    When start/end are set, the request covers that range. It does not
+    download ``data.lookback_candles`` and then discard everything outside
+    the window.
+    """
+    start, end = backtest_window(config)
+    if start is not None or end is not None:
+        df = dm.get_enriched_ohlcv(pair, since=start, until=end)
+    else:
+        df = dm.get_enriched_ohlcv(pair)
+    return clip_to_window(df, start, end)
+
+
 class BacktestEngine:
     """
     Walk-forward simulation on historical OHLCV data.
@@ -60,12 +113,12 @@ class BacktestEngine:
       4. Track equity, positions, and trade outcomes
     """
 
-    COMMISSION_PCT = 0.001   # 0.1%
     SLIPPAGE_PCT = 0.0003    # 0.03%
 
     def __init__(self, config: dict, initial_capital: float = 10_000.0) -> None:
         self.config = config
         self.initial_capital = initial_capital
+        self.commission_rate = commission_rate_from_config(config)
         self.logger = get_logger("BacktestEngine")
         self.dm = DataManager(config)
 
@@ -188,13 +241,14 @@ class BacktestEngine:
                 if should_close:
                     fill = current_price * (1 - self.SLIPPAGE_PCT if side == "buy" else 1 + self.SLIPPAGE_PCT)
                     qty = open_position["quantity"]
-                    cost = qty * fill
-                    commission = cost * self.COMMISSION_PCT
+                    # Entry commission was deducted when the position opened.
+                    # Charge the exit commission once, on the exit notional.
+                    exit_fee = qty * fill * self.commission_rate
 
                     if side == "buy":
-                        pnl = (fill - entry_p) * qty - 2 * entry_p * qty * self.COMMISSION_PCT
+                        pnl = (fill - entry_p) * qty - exit_fee
                     else:
-                        pnl = (entry_p - fill) * qty - 2 * entry_p * qty * self.COMMISSION_PCT
+                        pnl = (entry_p - fill) * qty - exit_fee
 
                     portfolio.current_capital += pnl
                     portfolio.update_peak()
@@ -222,9 +276,9 @@ class BacktestEngine:
                     slip = self.SLIPPAGE_PCT
                     fill = current_price * (1 + slip if side == "buy" else 1 - slip)
                     qty = params.quantity
-                    commission = qty * fill * self.COMMISSION_PCT
+                    entry_fee = qty * fill * self.commission_rate
 
-                    portfolio.current_capital -= commission
+                    portfolio.current_capital -= entry_fee
                     open_position = {
                         "side": side,
                         "entry_price": fill,
@@ -243,13 +297,19 @@ class BacktestEngine:
         if open_position:
             final_price = float(test_df.iloc[-1]["close"])
             side = open_position["side"]
-            pnl = (
-                (final_price - open_position["entry_price"]) * open_position["quantity"]
-                if side == "buy"
-                else (open_position["entry_price"] - final_price) * open_position["quantity"]
-            )
+            qty = open_position["quantity"]
+            exit_fee = qty * final_price * self.commission_rate
+            if side == "buy":
+                pnl = (final_price - open_position["entry_price"]) * qty - exit_fee
+            else:
+                pnl = (open_position["entry_price"] - final_price) * qty - exit_fee
             portfolio.current_capital += pnl
             portfolio.update_peak()
+            portfolio.trade_history.append({"pnl_usd": pnl})
+            equity_curve.append(portfolio.current_capital)
+            equity_times.append(test_df.index[-1])
+            if symbol in portfolio.open_positions:
+                del portfolio.open_positions[symbol]
             trades.append({
                 "entry_time": str(open_position["entry_time"]),
                 "exit_time": str(test_df.index[-1]),
@@ -360,22 +420,16 @@ def main():
 
     for pair in pairs:
         logger.info(f"\nFetching data for {pair}...")
-        df = dm.get_enriched_ohlcv(pair)
+        df = load_backtest_frame(dm, config, pair)
 
-        if df.empty:
+        if df is None or df.empty:
             logger.error(f"No data for {pair}")
             continue
 
-        # Filter by date range if specified
-        start = config.get("backtest", {}).get("start_date")
-        end = config.get("backtest", {}).get("end_date")
-        if start:
-            df = df[df.index >= pd.Timestamp(start, tz="UTC")]
-        if end:
-            df = df[df.index <= pd.Timestamp(end, tz="UTC")]
-
         if len(df) < 200:
-            logger.error(f"Insufficient data after date filter: {len(df)} rows")
+            logger.error(
+                f"Insufficient data for {pair} in the backtest window: {len(df)} rows"
+            )
             continue
 
         engine = BacktestEngine(config, initial_capital=initial_capital)
