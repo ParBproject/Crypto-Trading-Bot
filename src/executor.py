@@ -64,6 +64,11 @@ class PaperTradeEngine:
     Simulates order fills at current market price.
     Tracks open positions and cash in-memory.
     Includes simulated commission and slippage.
+
+    Position quantity is signed: positive is long, negative is short.
+    A sell with no long opens a short. A buy against a short covers it.
+    An order that crosses flat flips the position and opens the residual
+    at the fill price.
     """
 
     COMMISSION_PCT = 0.001   # 0.1% per trade
@@ -87,6 +92,8 @@ class PaperTradeEngine:
         Simulate a market order fill.
 
         Applies slippage: buys fill slightly above, sells slightly below.
+        Buys require enough cash for notional plus commission. Sells credit
+        proceeds net of commission, including when the sell opens a short.
         """
         slip = self.SLIPPAGE_PCT
         if side == "buy":
@@ -94,53 +101,45 @@ class PaperTradeEngine:
         else:
             fill_price = current_price * (1 - slip)
 
-        cost = quantity * fill_price
-        commission = cost * self.COMMISSION_PCT
+        notional = quantity * fill_price
+        commission = notional * self.COMMISSION_PCT
 
         self.order_counter += 1
         order_id = f"PAPER-{self.order_counter:06d}"
 
-        if side == "buy":
-            if cost + commission > self.cash:
-                return OrderResult(
-                    success=False,
-                    order_id=None,
-                    symbol=symbol,
-                    side=side,
-                    quantity=quantity,
-                    fill_price=fill_price,
-                    fill_time=datetime.utcnow(),
-                    cost_usd=cost,
-                    commission_usd=commission,
-                    mode="paper",
-                    error=f"Insufficient cash: need ${cost+commission:.2f}, have ${self.cash:.2f}",
-                )
-            self.cash -= (cost + commission)
-            self.positions[symbol] = {
-                "quantity": quantity,
-                "entry_price": fill_price,
-                "entry_time": datetime.utcnow(),
-                "side": side,
-            }
-            self.logger.info(
-                f"📄 PAPER BUY  {quantity:.6f} {symbol} @ {fill_price:.4f} "
-                f"| Cost: ${cost:.2f} | Cash left: ${self.cash:.2f}"
+        if side == "buy" and notional + commission > self.cash:
+            return OrderResult(
+                success=False,
+                order_id=None,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                fill_price=fill_price,
+                fill_time=datetime.utcnow(),
+                cost_usd=notional,
+                commission_usd=commission,
+                mode="paper",
+                error=f"Insufficient cash: need ${notional+commission:.2f}, have ${self.cash:.2f}",
             )
 
-        else:  # sell
-            existing = self.positions.get(symbol, {})
-            sell_qty = min(quantity, existing.get("quantity", 0))
-            if sell_qty <= 0:
-                # Short selling (if exchange supports)
-                sell_qty = quantity
+        # Buy spends cash; sell (long exit or short entry) receives it.
+        signed_qty = quantity if side == "buy" else -quantity
+        self.cash -= signed_qty * fill_price + commission
+        self._apply_position(symbol, signed_qty, fill_price)
 
-            proceeds = sell_qty * fill_price - commission
-            self.cash += proceeds
-            if symbol in self.positions:
-                del self.positions[symbol]
+        pos_qty = self.positions.get(symbol, {}).get("quantity", 0.0)
+        if side == "buy":
             self.logger.info(
-                f"📄 PAPER SELL {sell_qty:.6f} {symbol} @ {fill_price:.4f} "
-                f"| Proceeds: ${proceeds:.2f} | Cash: ${self.cash:.2f}"
+                f"📄 PAPER BUY  {quantity:.6f} {symbol} @ {fill_price:.4f} "
+                f"| Cost: ${notional:.2f} | Cash left: ${self.cash:.2f} "
+                f"| Position: {pos_qty:.6f}"
+            )
+        else:
+            proceeds = notional - commission
+            self.logger.info(
+                f"📄 PAPER SELL {quantity:.6f} {symbol} @ {fill_price:.4f} "
+                f"| Proceeds: ${proceeds:.2f} | Cash: ${self.cash:.2f} "
+                f"| Position: {pos_qty:.6f}"
             )
 
         return OrderResult(
@@ -151,13 +150,47 @@ class PaperTradeEngine:
             quantity=quantity,
             fill_price=fill_price,
             fill_time=datetime.utcnow(),
-            cost_usd=cost,
+            cost_usd=notional,
             commission_usd=commission,
             mode="paper",
         )
 
+    def _apply_position(self, symbol: str, signed_qty: float, fill_price: float) -> None:
+        """Update the signed position for one filled order.
+
+        `signed_qty` is positive on a buy and negative on a sell. Adding to
+        an existing side averages the entry price. Reducing it keeps the
+        original entry. Crossing through zero opens the residual at this fill.
+        """
+        existing = self.positions.get(symbol)
+        old_qty = float(existing["quantity"]) if existing else 0.0
+        new_qty = old_qty + signed_qty
+
+        if abs(new_qty) <= 1e-12:
+            self.positions.pop(symbol, None)
+            return
+
+        if existing is None or old_qty * new_qty < 0:
+            entry_price = fill_price
+            entry_time = datetime.utcnow()
+        elif abs(new_qty) > abs(old_qty):
+            entry_price = (
+                abs(old_qty) * existing["entry_price"] + abs(signed_qty) * fill_price
+            ) / abs(new_qty)
+            entry_time = existing["entry_time"]
+        else:
+            entry_price = existing["entry_price"]
+            entry_time = existing["entry_time"]
+
+        self.positions[symbol] = {
+            "quantity": new_qty,
+            "entry_price": entry_price,
+            "entry_time": entry_time,
+            "side": "buy" if new_qty > 0 else "sell",
+        }
+
     def get_balance(self) -> dict:
-        """Return current portfolio value breakdown."""
+        """Return cash and open positions. Position qty is signed (short < 0)."""
         return {
             "cash_usd": round(self.cash, 2),
             "positions": {
