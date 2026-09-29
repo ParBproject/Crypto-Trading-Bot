@@ -23,6 +23,10 @@ env/
 .ipynb_checkpoints/
 .streamlit/secrets.toml
 *.log
+logs/
+models/
+data/cache/
+data/bot_state.json
 
 # Editors and operating systems
 .vscode/
