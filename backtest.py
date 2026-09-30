@@ -140,6 +140,47 @@ def buy_and_hold_final_capital(
 # Backtest Engine
 # ─────────────────────────────────────────────────────────────
 
+def backtest_window(config: dict) -> tuple:
+    """Inclusive UTC bounds from ``backtest.start_date`` / ``end_date``."""
+    bt = config.get("backtest") or {}
+
+    def _ts(value):
+        if not value:
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    return _ts(bt.get("start_date")), _ts(bt.get("end_date"))
+
+
+def clip_to_window(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df
+    if start is not None:
+        out = out[out.index >= start]
+    if end is not None:
+        out = out[out.index <= end]
+    return out
+
+
+def load_backtest_frame(dm: DataManager, config: dict, pair: str) -> pd.DataFrame:
+    """Load candles for the configured window.
+
+    When start/end are set, the request covers that range. It does not
+    download ``data.lookback_candles`` and then discard everything outside
+    the window.
+    """
+    start, end = backtest_window(config)
+    if start is not None or end is not None:
+        df = dm.get_enriched_ohlcv(pair, since=start, until=end)
+    else:
+        df = dm.get_enriched_ohlcv(pair)
+    return clip_to_window(df, start, end)
+
+
 class BacktestEngine:
     """
     Walk-forward simulation on historical OHLCV data.
@@ -497,22 +538,16 @@ def main():
 
     for pair in pairs:
         logger.info(f"\nFetching data for {pair}...")
-        df = dm.get_enriched_ohlcv(pair)
+        df = load_backtest_frame(dm, config, pair)
 
-        if df.empty:
+        if df is None or df.empty:
             logger.error(f"No data for {pair}")
             continue
 
-        # Filter by date range if specified
-        start = config.get("backtest", {}).get("start_date")
-        end = config.get("backtest", {}).get("end_date")
-        if start:
-            df = df[df.index >= pd.Timestamp(start, tz="UTC")]
-        if end:
-            df = df[df.index <= pd.Timestamp(end, tz="UTC")]
-
         if len(df) < 200:
-            logger.error(f"Insufficient data after date filter: {len(df)} rows")
+            logger.error(
+                f"Insufficient data for {pair} in the backtest window: {len(df)} rows"
+            )
             continue
 
         engine = BacktestEngine(config, initial_capital=initial_capital)

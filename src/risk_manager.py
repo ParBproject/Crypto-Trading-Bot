@@ -544,6 +544,10 @@ class RiskManager:
         """
         Sortino Ratio — like Sharpe but only penalises downside volatility.
         Better suited to crypto's asymmetric return distribution.
+
+        Returns 0 when downside deviation is undefined: an empty series, a
+        flat series, or fewer than two negative observations. That avoids
+        dividing by a stand-in standard deviation.
         """
         if returns.empty:
             return 0.0

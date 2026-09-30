@@ -1,0 +1,13 @@
+{
+  "source": "Binance public historical archive (data.binance.vision)",
+  "files": "spot/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2024-01.zip through BTCUSDT-1h-2024-12.zip",
+  "symbol": "BTC/USDT",
+  "market": "Binance spot",
+  "interval": "1h",
+  "start": "2024-01-01T00:00:00Z",
+  "end": "2024-12-31T23:00:00Z",
+  "rows": 8784,
+  "gaps": 0,
+  "columns": ["timestamp", "open", "high", "low", "close", "volume"],
+  "note": "Official Binance spot klines for calendar year 2024 (366 days, hourly). api.binance.com returned HTTP 451 from the environment used to build this sample, so the candles were taken from the public monthly archive instead of the live REST API. The file is the input to scripts/reproduce_backtest.py."
+}
