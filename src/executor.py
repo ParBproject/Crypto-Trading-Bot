@@ -16,6 +16,7 @@ Safety features:
   - All fills written to TradeJournal and portfolio state
 """
 
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -308,6 +309,24 @@ class LiveExecutor:
 # Order Manager — top-level facade
 # ─────────────────────────────────────────────────────────────
 
+def ensure_live_trading_allowed(config: dict) -> None:
+    """Refuse live orders unless the process explicitly arms them.
+
+    ``trading.mode`` defaults to paper. A config value of ``live`` is not
+    enough: ``ALLOW_LIVE_TRADING`` must be exactly ``1``. Real-money keys
+    also require ``exchange.sandbox: false``.
+    """
+    mode = str((config.get("trading") or {}).get("mode", "paper")).lower()
+    if mode != "live":
+        return
+    if os.getenv("ALLOW_LIVE_TRADING") != "1":
+        raise RuntimeError(
+            "Live trading is disabled. The default is paper. "
+            "Set ALLOW_LIVE_TRADING=1 to arm live orders, then confirm at the prompt. "
+            "Real-money keys also require exchange.sandbox: false."
+        )
+
+
 class OrderManager:
     """
     Unified order management layer.
@@ -334,6 +353,7 @@ class OrderManager:
             self.engine = PaperTradeEngine(initial_capital=float(initial))
             self.logger.info(f"Order manager: PAPER mode (capital=${initial:,.0f})")
         elif self.mode == "live":
+            ensure_live_trading_allowed(self.config)
             if ccxt_fetcher is None:
                 raise RuntimeError("CCXTFetcher required for live mode.")
             self.engine = LiveExecutor(ccxt_fetcher)

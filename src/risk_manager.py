@@ -26,6 +26,39 @@ import pandas as pd
 from src.logger import get_logger
 
 
+def infer_periods_per_year(index, fallback: int = 365 * 24) -> int:
+    """Bar frequency implied by the median spacing of `index`.
+
+    Crypto trades every day, so a 1-day bar is 365 periods and a 1-hour bar
+    is 365 * 24. Sharpe and Sortino use this instead of assuming every series
+    is hourly.
+    """
+    if index is None or len(index) < 2:
+        return fallback
+    seconds = pd.Series(pd.DatetimeIndex(index)).diff().dt.total_seconds().dropna()
+    if seconds.empty:
+        return fallback
+    step = float(seconds.median())
+    if not np.isfinite(step) or step <= 0:
+        return fallback
+    return int(round((365 * 24 * 3600) / step))
+
+
+def marks_from_ohlcv(frames: dict) -> dict:
+    """Last close per symbol. Non-positive or missing closes are skipped."""
+    marks = {}
+    for symbol, df in (frames or {}).items():
+        if df is None or getattr(df, "empty", True):
+            continue
+        columns = getattr(df, "columns", [])
+        if "close" not in columns:
+            continue
+        price = float(df["close"].iloc[-1])
+        if np.isfinite(price) and price > 0:
+            marks[symbol] = price
+    return marks
+
+
 # ─────────────────────────────────────────────────────────────
 # Data Classes
 # ─────────────────────────────────────────────────────────────
@@ -65,13 +98,51 @@ class PortfolioState:
     def __post_init__(self):
         if self.peak_capital == 0.0:
             self.peak_capital = self.current_capital
+        # Latest marks used for equity. Quantity on open_positions is absolute;
+        # side is "buy" or "sell". Empty marks mean equity is realized capital.
+        self._mark_prices: dict = {}
+
+    def equity_value(self) -> float:
+        """Realized capital plus open P&L at the latest marks.
+
+        Without marks this is current_capital, which only moves when a fill
+        pays commission or realizes P&L.
+        """
+        unrealized = 0.0
+        marks = getattr(self, "_mark_prices", {}) or {}
+        for symbol, pos in self.open_positions.items():
+            price = marks.get(symbol)
+            if price is None:
+                continue
+            qty = float(pos.get("quantity", 0.0))
+            entry = float(pos.get("entry_price", price))
+            if str(pos.get("side", "buy")).lower() == "sell":
+                unrealized += (entry - float(price)) * qty
+            else:
+                unrealized += (float(price) - entry) * qty
+        return self.current_capital + unrealized
+
+    def update_marks(self, prices: dict) -> float:
+        """Store positive marks and raise the equity peak. Missing symbols keep the previous mark."""
+        updated = dict(getattr(self, "_mark_prices", {}) or {})
+        for symbol, value in (prices or {}).items():
+            if value is None:
+                continue
+            price = float(value)
+            if np.isfinite(price) and price > 0:
+                updated[symbol] = price
+        self._mark_prices = updated
+        equity = self.equity_value()
+        if equity > self.peak_capital:
+            self.peak_capital = equity
+        return equity
 
     @property
     def drawdown_pct(self) -> float:
-        """Current drawdown from peak capital (positive = drawdown)."""
+        """Drawdown from peak equity, including open P&L when marks exist."""
         if self.peak_capital == 0:
             return 0.0
-        return (1 - self.current_capital / self.peak_capital) * 100
+        return (1 - self.equity_value() / self.peak_capital) * 100
 
     @property
     def total_open_exposure_usd(self) -> float:
@@ -159,6 +230,9 @@ class RiskManager:
             return None
 
         capital = self.portfolio.current_capital
+        if capital <= 0:
+            self.logger.warning(f"No capital available for {symbol}")
+            return None
 
         # ── Stop distance ──────────────────────────────────────
         stop_distance = self.atr_stop_multiplier * atr
@@ -180,6 +254,23 @@ class RiskManager:
 
         if quantity <= 0:
             self.logger.debug(f"Position size too small — skipping {symbol}")
+            return None
+
+        # Spot sizing: notional cannot exceed cash, and one symbol cannot
+        # exceed the exposure cap. Shrink the risk-based size; do not lever up.
+        notes = ""
+        max_notional = min(capital, capital * (self.max_single_asset_pct / 100.0))
+        max_qty = max_notional / entry_price if entry_price > 0 else 0.0
+        if quantity > max_qty:
+            quantity = max_qty
+            notes = "size capped by cash and single-asset exposure"
+            self.logger.info(
+                f"{symbol} size capped at qty={quantity:.8f} "
+                f"(notional ≤ ${max_notional:.2f})"
+            )
+
+        quantity = round(quantity, 8)
+        if quantity <= 0:
             return None
 
         position_value = quantity * entry_price
@@ -207,7 +298,7 @@ class RiskManager:
             symbol=symbol,
             side=side,
             entry_price=round(entry_price, 8),
-            quantity=round(quantity, 8),
+            quantity=quantity,
             stop_loss=round(stop_loss, 8),
             take_profit=round(take_profit, 8),
             risk_usd=round(risk_usd, 4),
@@ -215,6 +306,7 @@ class RiskManager:
             risk_pct_of_account=round(risk_pct, 4),
             reward_risk_ratio=round(realised_rr, 3),
             sizing_method="kelly" if self.use_kelly else "fixed_pct",
+            notes=notes,
         )
 
         self.logger.info(
@@ -455,10 +547,16 @@ class RiskManager:
         """
         if returns.empty:
             return 0.0
+        downside = returns[returns < 0]
+        # One negative observation has no sample deviation. A stand-in such as
+        # 1e-9 turns a quiet equity curve into an absurd ratio.
+        if len(downside) < 2:
+            return 0.0
+        downside_std = float(downside.std())
+        if not np.isfinite(downside_std) or downside_std == 0:
+            return 0.0
         rf_per_period = risk_free_rate / periods_per_year
         excess = returns - rf_per_period
-        downside = returns[returns < 0]
-        downside_std = downside.std() if len(downside) > 1 else 1e-9
         return float((excess.mean() / downside_std) * np.sqrt(periods_per_year))
 
     @staticmethod
@@ -498,10 +596,14 @@ class RiskManager:
         total = len(trade_pnls)
         win_rate = (wins / total * 100) if total > 0 else 0.0
 
+        equity = p.equity_value()
         return {
             "initial_capital_usd": p.initial_capital,
             "current_capital_usd": round(p.current_capital, 2),
-            "unrealised_pnl_usd": round(p.current_capital - p.initial_capital, 2),
+            "equity_usd": round(equity, 2),
+            "realized_pnl_usd": round(p.current_capital - p.initial_capital, 2),
+            "unrealised_pnl_usd": round(equity - p.current_capital, 2),
+            "total_pnl_usd": round(equity - p.initial_capital, 2),
             "peak_capital_usd": round(p.peak_capital, 2),
             "drawdown_pct": round(p.drawdown_pct, 2),
             "open_positions": len(p.open_positions),

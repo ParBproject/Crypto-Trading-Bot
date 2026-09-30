@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 
 from src.data_fetcher import DataManager
 from src.predictor import PredictorRegistry
-from src.risk_manager import RiskManager, PortfolioState
+from src.risk_manager import RiskManager, PortfolioState, marks_from_ohlcv
 from src.strategy import StrategyEngine, SignalType
 from src.executor import OrderManager
 from src.logger import get_logger, TradeJournal, NotificationDispatcher
@@ -242,6 +242,7 @@ class CryptoBot:
             try:
                 # ── 1. Update market data ──────────────────────
                 data_store = self._refresh_data()
+                self._mark_open_positions(data_store)
 
                 # ── 2. Drawdown guard ──────────────────────────
                 dd = self.portfolio.drawdown_pct
@@ -333,6 +334,19 @@ class CryptoBot:
                 time.sleep(5)   # Brief pause before retrying
 
             self._sleep(tick_start)
+
+    def _mark_open_positions(self, data_store: dict) -> None:
+        """Mark equity from the latest close, then a live ticker if one exists.
+
+        Drawdown uses this equity, so an open loss can halt new trades
+        before the position is closed.
+        """
+        marks = marks_from_ohlcv(data_store)
+        for symbol in self.portfolio.open_positions:
+            price = self.data_manager.get_current_price(symbol)
+            if price:
+                marks[symbol] = float(price)
+        self.portfolio.update_marks(marks)
 
     def _refresh_data(self) -> dict:
         """
@@ -448,7 +462,7 @@ class CryptoBot:
         self.notifier.send(
             f"🛑 CryptoBot stopped\n"
             f"Capital: ${summary.get('current_capital_usd', 0):.2f}\n"
-            f"P&L: ${summary.get('unrealised_pnl_usd', 0):+.2f}",
+            f"P&L: ${summary.get('total_pnl_usd', 0):+.2f}",
             "info",
         )
 

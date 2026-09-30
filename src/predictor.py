@@ -19,6 +19,7 @@ Usage:
 """
 
 import os
+import random
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -195,6 +196,62 @@ class SequenceBuilder:
 
         return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
+    def split_train_val(self, df: pd.DataFrame, val_fraction: float):
+        """Fit the scaler on the training prefix only, then split sequences in time.
+
+        The validation tail must not move the medians used to scale training
+        rows. A sequence is validation when its target close is in that tail.
+        The lookback for the first validation sequence may still reach into
+        the training prefix; those rows were already in the fit.
+        """
+        self.feature_columns = self._select_features(df)
+        raw = df[self.feature_columns].to_numpy(dtype=np.float64)
+        valid = ~np.isnan(raw).any(axis=1)
+        data = raw[valid]
+        close_prices = df["close"].to_numpy(dtype=np.float64)[valid]
+        n = len(data)
+        needed = self.sequence_length + self.forecast_horizon + 1
+        if n < needed:
+            raise ValueError(
+                f"Insufficient data: need ≥ {needed} valid rows, got {n}"
+            )
+
+        fraction = float(val_fraction)
+        if fraction <= 0 or fraction >= 1:
+            fit_end = n
+        else:
+            fit_end = int(n * (1.0 - fraction))
+            fit_end = min(max(fit_end, self.sequence_length + self.forecast_horizon), n - 1)
+
+        self.scaler.fit(data[:fit_end])
+        self._is_fitted = True
+        scaled = self.scaler.transform(data).astype(np.float32)
+        X, y = self._build_sequences(scaled, close_prices)
+
+        if fraction <= 0 or fraction >= 1:
+            empty_x = np.empty((0, self.sequence_length, scaled.shape[1]), dtype=np.float32)
+            return X, y, empty_x, np.empty((0,), dtype=np.float32)
+
+        # Sample k uses feature window ending at index (sequence_length + k - 1)
+        # and target close at index (sequence_length + k + horizon - 2).
+        # Hold out samples whose target index is in the unfitted tail.
+        k_val = fit_end - self.forecast_horizon + 1 - self.sequence_length
+        k_val = max(0, min(len(X), k_val))
+        return X[:k_val], y[:k_val], X[k_val:], y[k_val:]
+
+
+def training_seed(config: dict) -> int:
+    """Seed from config.model.seed. Default is fixed so a rerun matches."""
+    return int((config.get("model") or {}).get("seed", 42))
+
+
+def set_training_seed(seed: int) -> None:
+    """Seed Python, NumPy, and TensorFlow before a training run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    if TF_AVAILABLE:
+        tf.random.set_seed(seed)
+
 
 # ─────────────────────────────────────────────────────────────
 # LSTM Model Builder
@@ -358,23 +415,27 @@ class LSTMPredictor:
         if not TF_AVAILABLE:
             raise ImportError("TensorFlow required for training.")
 
+        set_training_seed(training_seed(self.config))
+
         self.logger.info(
             f"Starting LSTM training for {self.symbol} "
             f"({len(df)} rows, seq_len={self.seq_len})"
         )
         t0 = time.time()
 
-        # Build sequences
-        X, y = self.seq_builder.fit_transform(df)
-        n_features = X.shape[2]
-        self.logger.info(
-            f"Training data: X={X.shape}, y={y.shape}, features={n_features}"
+        # Fit the scaler on the training prefix, then split in time.
+        X_train, y_train, X_val, y_val = self.seq_builder.split_train_val(
+            df, self.val_split
         )
-
-        # Split: last val_split fraction for validation (temporal, no shuffle)
-        split_idx = int(len(X) * (1 - self.val_split))
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
+        if len(X_train) < 1 or len(X_val) < 1:
+            raise ValueError(
+                "Need rows on both sides of the temporal validation split."
+            )
+        n_features = X_train.shape[2]
+        self.logger.info(
+            f"Training data: X={X_train.shape}, y={y_train.shape}, "
+            f"val={X_val.shape}, features={n_features}"
+        )
 
         # Build fresh model
         self.model = build_lstm_model(
