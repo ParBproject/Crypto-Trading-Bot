@@ -27,6 +27,8 @@ A modular cryptocurrency-trading research system combining market-data retrieval
 
 ## Visual Evidence
 
+The screenshots are interface illustrations for the write-up. They are not the output of `python backtest.py`. Measured results are the metrics table that command prints, including buy-and-hold.
+
 ### Bot Startup
 
 ![Paper-trading startup sequence](docs/screenshots/01_bot_startup.png)
@@ -78,7 +80,7 @@ python backtest.py
 python main.py
 ~~~
 
-Review "config/config.yaml" before running. Keep execution in paper or sandbox mode until every exchange, order, and failure path has been independently tested.
+Review `config/config.yaml` before running. `trading.mode` defaults to `paper`. Live orders are refused unless `ALLOW_LIVE_TRADING=1`, and `main.py` still asks for a confirmation phrase. Real-money keys also require `exchange.sandbox: false`.
 
 ## Repository Structure
 
@@ -103,6 +105,16 @@ Crypto-Trading-Bot/
 ## Skills Demonstrated
 
 Python, modular system design, time-series modelling, TensorFlow, exchange data integration, backtesting, configuration management, paper execution, logging, and financial risk controls.
+
+## Backtest assumptions
+
+`python backtest.py` walks one bar at a time:
+
+- A signal is computed at the close and filled at the next bar's open. It does not trade that same bar's close.
+- Stop-loss and take-profit are resting orders. They fill from the bar's high and low. If both are touched, the stop fills first. A gap through the level fills at the open.
+- `backtest.commission_pct` and `backtest.slippage_pct` are percents (`0.1` means 0.1%). Each is charged on entry and on exit.
+- The equity curve marks open positions to market, so drawdown includes unrealized losses. Sharpe and Sortino use the bar spacing in the data rather than assuming every series is hourly.
+- `buy_hold_return_pct` is a fully invested long from the first bar the strategy could have traded through the last close, with the same fees and slippage. The strategy sizes from the risk budget, so the two returns are not the same bet size.
 
 ## Risk & Security Notice
 

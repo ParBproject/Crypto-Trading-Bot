@@ -1,0 +1,11 @@
+# Pinned dependencies for CI and local tests.
+# The runtime stack in requirements.txt still allows ranges for optional
+# exchange, TensorFlow, and notification packages, which CI does not install.
+numpy==2.4.4
+pandas==3.0.6
+scikit-learn==1.9.1
+pytest==9.1.1
+PyYAML==6.0.1
+python-dotenv==1.2.3
+tabulate==0.10.0
+ruff==0.16.9
