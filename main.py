@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.bot import CryptoBot, load_config
+from src.executor import ensure_live_trading_allowed
 from src.logger import get_logger
 
 
@@ -76,9 +77,16 @@ def main():
     if args.pairs:
         config.setdefault("trading", {})["pairs"] = args.pairs
 
-    # Safety gate for live mode
+    # Safety gate for live mode. The env flag is checked before the prompt
+    # so a headless run cannot sit on input() and cannot reach the exchange
+    # just because the YAML says live.
     mode = config.get("trading", {}).get("mode", "paper")
     if mode == "live":
+        try:
+            ensure_live_trading_allowed(config)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
         print("\n" + "=" * 60)
         print("  ⚠️  WARNING: LIVE TRADING MODE")
         print("  Real funds will be used for trading.")

@@ -3,11 +3,15 @@
 backtest.py — Historical Strategy Backtester
 =============================================
 Simulates the trading strategy on historical OHLCV data to evaluate:
-  - Total return
+  - Total return, against a fully invested buy-and-hold
   - Sharpe ratio, Sortino ratio, Calmar ratio
-  - Maximum drawdown
+  - Maximum drawdown on mark-to-market equity
   - Win rate, average win/loss
   - Equity curve
+
+Fills are not same-bar closes. A signal is decided at the bar close and
+filled at the next bar's open. Resting stops and targets fill from that
+bar's high and low; if both are touched, the stop fills first.
 
 The backtest uses the same DataManager, LSTMPredictor, StrategyEngine,
 and RiskManager as the live bot — ensuring consistency between
@@ -30,7 +34,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from tabulate import tabulate
 
@@ -38,28 +41,104 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.bot import load_config
 from src.data_fetcher import DataManager
-from src.predictor import LSTMPredictor, PredictorRegistry
-from src.risk_manager import RiskManager, PortfolioState
+from src.predictor import LSTMPredictor
+from src.risk_manager import RiskManager, PortfolioState, infer_periods_per_year
 from src.strategy import StrategyEngine, SignalType
-from src.executor import PaperTradeEngine, OrderResult
-from src.logger import get_logger, TradeJournal
+from src.logger import get_logger
+
+
+# ─────────────────────────────────────────────────────────────
+# Costs and fills
+# ─────────────────────────────────────────────────────────────
+
+def _percent_rate(config: dict, key: str, default_percent: float) -> float:
+    """Read a backtest cost written as a percent. 0.1 means 0.1%, not 10%."""
+    pct = float((config.get("backtest") or {}).get(key, default_percent))
+    if pct < 0:
+        raise ValueError(f"backtest.{key} must be >= 0")
+    return pct / 100.0
+
+
+def commission_rate_from_config(config: dict) -> float:
+    """Per-fill commission fraction. Entry and exit each pay it once."""
+    return _percent_rate(config, "commission_pct", 0.1)
+
+
+def slippage_rate_from_config(config: dict) -> float:
+    """Adverse slippage fraction applied to each fill."""
+    return _percent_rate(config, "slippage_pct", 0.05)
+
+
+def ohlc_values(row: pd.Series) -> tuple:
+    """Open, high, low, close. Missing OHLC falls back to the close."""
+    close = float(row["close"])
+
+    def _num(key: str, default: float) -> float:
+        if key not in row.index:
+            return default
+        val = row[key]
+        if val is None or pd.isna(val):
+            return default
+        return float(val)
+
+    open_ = _num("open", close)
+    high = max(_num("high", max(open_, close)), open_, close)
+    low = min(_num("low", min(open_, close)), open_, close)
+    return open_, high, low, close
+
+
+def protective_exit(side: str, open_: float, high: float, low: float, stop: float, take_profit: float):
+    """Raw price of a resting stop or target, before slippage.
+
+    The bar's high and low are the path. A close that recovers does not
+    cancel a level the range already traded. If both levels are touched
+    and the open is still between them, the stop fills first. A gap
+    through a level fills at the open, not at the level on the wrong side
+    of the gap.
+    """
+    if side == "buy":
+        stop_hit = low <= stop
+        target_hit = high >= take_profit
+        gapped_stop = open_ <= stop
+        gapped_target = open_ >= take_profit
+    else:
+        stop_hit = high >= stop
+        target_hit = low <= take_profit
+        gapped_stop = open_ >= stop
+        gapped_target = open_ <= take_profit
+
+    if gapped_stop and (stop_hit or gapped_stop):
+        return open_, "stop_loss"
+    if gapped_target and target_hit:
+        return open_, "take_profit"
+    if stop_hit and target_hit:
+        return stop, "stop_loss"
+    if stop_hit:
+        return stop, "stop_loss"
+    if target_hit:
+        return take_profit, "take_profit"
+    return None, ""
+
+
+def buy_and_hold_final_capital(
+    initial: float,
+    entry_open: float,
+    exit_close: float,
+    commission_rate: float,
+    slippage_rate: float,
+) -> float:
+    """Fully invested spot long, same commission and slippage as the strategy."""
+    entry = float(entry_open) * (1 + slippage_rate)
+    if initial <= 0 or entry <= 0:
+        return float(initial)
+    qty = initial / (entry * (1 + commission_rate))
+    exit_fill = max(0.0, float(exit_close) * (1 - slippage_rate))
+    return qty * exit_fill * (1 - commission_rate)
 
 
 # ─────────────────────────────────────────────────────────────
 # Backtest Engine
 # ─────────────────────────────────────────────────────────────
-
-def commission_rate_from_config(config: dict) -> float:
-    """Return the per-fill commission as a fraction.
-
-    ``backtest.commission_pct`` is a percent: 0.1 means 0.1% (rate 0.001),
-    matching the comment in config.yaml. Entry and exit each pay this once.
-    """
-    pct = float((config.get("backtest") or {}).get("commission_pct", 0.1))
-    if pct < 0:
-        raise ValueError("backtest.commission_pct must be >= 0")
-    return pct / 100.0
-
 
 def backtest_window(config: dict) -> tuple:
     """Inclusive UTC bounds from ``backtest.start_date`` / ``end_date``."""
@@ -108,17 +187,17 @@ class BacktestEngine:
 
     Methodology:
       1. Split data: first 70% for model training, last 30% for testing
-      2. Walk forward candle-by-candle through test period
-      3. At each candle, run prediction → signal → (simulated) execution
-      4. Track equity, positions, and trade outcomes
+      2. Decide at the close of bar t using only bars through t
+      3. Fill that decision at the open of bar t+1
+      4. Check the resting stop and target against bar t+1 high/low
+      5. Mark equity to the close, including open P&L
     """
-
-    SLIPPAGE_PCT = 0.0003    # 0.03%
 
     def __init__(self, config: dict, initial_capital: float = 10_000.0) -> None:
         self.config = config
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate_from_config(config)
+        self.slippage_rate = slippage_rate_from_config(config)
         self.logger = get_logger("BacktestEngine")
         self.dm = DataManager(config)
 
@@ -183,148 +262,133 @@ class BacktestEngine:
         strategy = StrategyEngine(self.config, risk_mgr)
 
         # ── Tracking ───────────────────────────────────────────
-        equity_curve = [self.initial_capital]
-        equity_times = [test_df.index[0]]
+        equity_curve = []
+        equity_times = []
         trades = []
         open_position = None
+        pending_entry = None
+        pending_exit = False
 
-        seq_len = self.config.get("model", {}).get("sequence_length", 60)
+        seq_len = int(self.config.get("model", {}).get("sequence_length", 60))
+        self.logger.info(
+            "Execution: signal at bar close, fill at next open; "
+            f"commission={self.commission_rate:.4%}, slippage={self.slippage_rate:.4%}"
+        )
+
+        def mark(close_price: float) -> float:
+            if open_position is None:
+                return portfolio.current_capital
+            qty = open_position["quantity"]
+            entry = open_position["entry_price"]
+            if open_position["side"] == "buy":
+                unrealized = (close_price - entry) * qty
+            else:
+                unrealized = (entry - close_price) * qty
+            return portfolio.current_capital + unrealized
+
+        def liquidate(raw_price: float, reason: str, when) -> None:
+            nonlocal open_position
+            position = open_position
+            side = position["side"]
+            fill = self._slip_exit(side, raw_price)
+            qty = position["quantity"]
+            exit_fee = qty * fill * self.commission_rate
+            if side == "buy":
+                pnl = (fill - position["entry_price"]) * qty - exit_fee
+            else:
+                pnl = (position["entry_price"] - fill) * qty - exit_fee
+            portfolio.current_capital += pnl
+            portfolio.update_peak()
+            portfolio.trade_history.append({"pnl_usd": pnl})
+            trades.append({
+                "entry_time": str(position["entry_time"]),
+                "exit_time": str(when),
+                "symbol": symbol,
+                "side": side,
+                "entry_price": position["entry_price"],
+                "exit_price": fill,
+                "quantity": qty,
+                "pnl_usd": round(pnl, 4),
+                "reason": reason,
+            })
+            open_position = None
+            portfolio.open_positions.pop(symbol, None)
 
         # ── Walk-forward loop ──────────────────────────────────
-        for i in range(seq_len, len(test_df)):
-            # Build look-back window for inference
-            window_df = pd.concat([train_df.tail(seq_len), test_df.iloc[:i]])
-            current_row = test_df.iloc[i]
-            current_price = float(current_row["close"])
-            current_time = test_df.index[i]
+        # Bar i is processed with information known during that bar.
+        # Decisions made at the close wait for the next open.
+        for i in range(len(test_df)):
+            open_, high, low, close = ohlc_values(test_df.iloc[i])
+            when = test_df.index[i]
 
-            # LSTM prediction
+            if open_position is not None and pending_exit:
+                liquidate(open_, "signal_exit", when)
+                pending_exit = False
+
+            if open_position is None and pending_entry is not None:
+                open_position = self._open_position(
+                    pending_entry, open_, when, portfolio, symbol
+                )
+                pending_entry = None
+
+            if open_position is not None:
+                raw, reason = protective_exit(
+                    open_position["side"],
+                    open_,
+                    high,
+                    low,
+                    open_position["stop_loss"],
+                    open_position["take_profit"],
+                )
+                if raw is not None:
+                    liquidate(raw, reason, when)
+                    pending_exit = False
+
+            equity_curve.append(mark(close))
+            equity_times.append(when)
+
+            if i < seq_len - 1:
+                continue
+
+            window_df = pd.concat([train_df.tail(seq_len), test_df.iloc[: i + 1]])
             prediction = None
             if predictor is not None:
                 try:
                     prediction = predictor.predict(window_df)
                 except Exception:
-                    pass
+                    prediction = None
 
-            # Strategy signal
             signal = strategy.evaluate(
                 symbol=symbol,
                 df=window_df,
                 prediction=prediction,
                 existing_position=open_position,
             )
+            # A decision at this close can fill on a later bar only.
+            if i >= len(test_df) - 1:
+                continue
+            if open_position is not None and signal.signal_type == SignalType.EXIT:
+                pending_exit = True
+            elif (
+                open_position is None
+                and signal.is_actionable()
+                and signal.signal_type != SignalType.EXIT
+                and signal.trade_params is not None
+                and risk_mgr.is_trade_allowed(signal.trade_params)
+            ):
+                pending_entry = signal
 
-            # ── Manage open position ───────────────────────────
-            if open_position:
-                entry_p = open_position["entry_price"]
-                stop = open_position["stop_loss"]
-                tp = open_position["take_profit"]
-                side = open_position["side"]
-
-                should_close = False
-                close_reason = ""
-
-                if side == "buy":
-                    if current_price <= stop:
-                        should_close, close_reason = True, "stop_loss"
-                    elif current_price >= tp:
-                        should_close, close_reason = True, "take_profit"
-                else:
-                    if current_price >= stop:
-                        should_close, close_reason = True, "stop_loss"
-                    elif current_price <= tp:
-                        should_close, close_reason = True, "take_profit"
-
-                if signal.signal_type.value == "exit":
-                    should_close, close_reason = True, "signal_exit"
-
-                if should_close:
-                    fill = current_price * (1 - self.SLIPPAGE_PCT if side == "buy" else 1 + self.SLIPPAGE_PCT)
-                    qty = open_position["quantity"]
-                    # Entry commission was deducted when the position opened.
-                    # Charge the exit commission once, on the exit notional.
-                    exit_fee = qty * fill * self.commission_rate
-
-                    if side == "buy":
-                        pnl = (fill - entry_p) * qty - exit_fee
-                    else:
-                        pnl = (entry_p - fill) * qty - exit_fee
-
-                    portfolio.current_capital += pnl
-                    portfolio.update_peak()
-                    portfolio.trade_history.append({"pnl_usd": pnl})
-
-                    trades.append({
-                        "entry_time": str(open_position["entry_time"]),
-                        "exit_time": str(current_time),
-                        "symbol": symbol,
-                        "side": side,
-                        "entry_price": entry_p,
-                        "exit_price": fill,
-                        "quantity": qty,
-                        "pnl_usd": round(pnl, 4),
-                        "reason": close_reason,
-                    })
-                    open_position = None
-                    del portfolio.open_positions[symbol]
-
-            # ── Open new position ──────────────────────────────
-            if open_position is None and signal.is_actionable() and signal.signal_type.value != "exit":
-                params = signal.trade_params
-                if params and risk_mgr.is_trade_allowed(params):
-                    side = "buy" if signal.signal_type == SignalType.LONG else "sell"
-                    slip = self.SLIPPAGE_PCT
-                    fill = current_price * (1 + slip if side == "buy" else 1 - slip)
-                    qty = params.quantity
-                    entry_fee = qty * fill * self.commission_rate
-
-                    portfolio.current_capital -= entry_fee
-                    open_position = {
-                        "side": side,
-                        "entry_price": fill,
-                        "entry_time": current_time,
-                        "quantity": qty,
-                        "stop_loss": params.stop_loss,
-                        "take_profit": params.take_profit,
-                        "value_usd": qty * fill,
-                    }
-                    portfolio.open_positions[symbol] = open_position
-
-            equity_curve.append(portfolio.current_capital)
-            equity_times.append(current_time)
-
-        # ── Force-close any open position at end ───────────────
-        if open_position:
-            final_price = float(test_df.iloc[-1]["close"])
-            side = open_position["side"]
-            qty = open_position["quantity"]
-            exit_fee = qty * final_price * self.commission_rate
-            if side == "buy":
-                pnl = (final_price - open_position["entry_price"]) * qty - exit_fee
-            else:
-                pnl = (open_position["entry_price"] - final_price) * qty - exit_fee
-            portfolio.current_capital += pnl
-            portfolio.update_peak()
-            portfolio.trade_history.append({"pnl_usd": pnl})
-            equity_curve.append(portfolio.current_capital)
-            equity_times.append(test_df.index[-1])
-            if symbol in portfolio.open_positions:
-                del portfolio.open_positions[symbol]
-            trades.append({
-                "entry_time": str(open_position["entry_time"]),
-                "exit_time": str(test_df.index[-1]),
-                "symbol": symbol,
-                "side": side,
-                "entry_price": open_position["entry_price"],
-                "exit_price": final_price,
-                "quantity": open_position["quantity"],
-                "pnl_usd": round(pnl, 4),
-                "reason": "end_of_backtest",
-            })
+        # The sample has ended, so an open position is liquidated at the
+        # last close. There is no next open to trade.
+        if open_position is not None:
+            _last_open, _last_high, _last_low, last_close = ohlc_values(test_df.iloc[-1])
+            liquidate(last_close, "end_of_backtest", test_df.index[-1])
+            equity_curve[-1] = portfolio.current_capital
 
         # ── Compute metrics ────────────────────────────────────
         equity_series = pd.Series(equity_curve, index=equity_times, name="equity")
         returns = equity_series.pct_change().dropna()
+        periods_per_year = infer_periods_per_year(test_df.index)
 
         total_return_pct = (portfolio.current_capital / self.initial_capital - 1) * 100
         n_days = (test_df.index[-1] - test_df.index[0]).days or 1
@@ -332,12 +396,28 @@ class BacktestEngine:
             (portfolio.current_capital / self.initial_capital) ** (365 / n_days) - 1
         ) * 100
 
+        entry_i = seq_len if seq_len < len(test_df) else 0
+        bh_open, _, _, _ = ohlc_values(test_df.iloc[entry_i])
+        _, _, _, bh_close = ohlc_values(test_df.iloc[-1])
+        bh_final = buy_and_hold_final_capital(
+            self.initial_capital,
+            bh_open,
+            bh_close,
+            self.commission_rate,
+            self.slippage_rate,
+        )
+        bh_return_pct = (bh_final / self.initial_capital - 1) * 100
+
         pnls = [t["pnl_usd"] for t in trades]
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
+        if losses and sum(losses) != 0:
+            profit_factor = round(abs(sum(wins) / sum(losses)), 3)
+        else:
+            profit_factor = None
 
-        sharpe = RiskManager.compute_sharpe_ratio(returns)
-        sortino = RiskManager.compute_sortino_ratio(returns)
+        sharpe = RiskManager.compute_sharpe_ratio(returns, periods_per_year=periods_per_year)
+        sortino = RiskManager.compute_sortino_ratio(returns, periods_per_year=periods_per_year)
         max_dd = RiskManager.compute_max_drawdown(equity_series)
         calmar = RiskManager.compute_calmar_ratio(annualised_return, max_dd)
 
@@ -345,9 +425,15 @@ class BacktestEngine:
             "symbol": symbol,
             "period": f"{test_df.index[0].date()} → {test_df.index[-1].date()}",
             "candles_tested": len(test_df),
+            "fill_model": "next_bar_open",
+            "stop_model": "intrabar_ohlc_stop_first",
+            "periods_per_year": periods_per_year,
             "initial_capital_usd": self.initial_capital,
             "final_capital_usd": round(portfolio.current_capital, 2),
             "total_return_pct": round(total_return_pct, 2),
+            "buy_hold_final_capital_usd": round(bh_final, 2),
+            "buy_hold_return_pct": round(bh_return_pct, 2),
+            "excess_return_pct": round(total_return_pct - bh_return_pct, 2),
             "annualised_return_pct": round(annualised_return, 2),
             "sharpe_ratio": round(sharpe, 3),
             "sortino_ratio": round(sortino, 3),
@@ -357,12 +443,44 @@ class BacktestEngine:
             "win_rate_pct": round(len(wins) / len(trades) * 100, 2) if trades else 0,
             "avg_win_usd": round(sum(wins) / len(wins), 2) if wins else 0,
             "avg_loss_usd": round(sum(losses) / len(losses), 2) if losses else 0,
-            "profit_factor": round(abs(sum(wins) / sum(losses)), 3) if losses and sum(losses) else float("inf"),
-            "strategy": "LSTM+TA" if use_ml else "TA-only",
+            "profit_factor": profit_factor,
+            "strategy": "LSTM+TA" if use_ml and predictor is not None else "TA-only",
             "trades": trades,
             "equity_curve": list(zip([str(t) for t in equity_times], equity_curve)),
         }
         return metrics
+
+    def _slip_entry(self, side: str, raw: float) -> float:
+        if side == "buy":
+            return raw * (1 + self.slippage_rate)
+        return raw * (1 - self.slippage_rate)
+
+    def _slip_exit(self, side: str, raw: float) -> float:
+        """Adverse slippage: sells receive less, covers pay more."""
+        if side == "buy":
+            return raw * (1 - self.slippage_rate)
+        return raw * (1 + self.slippage_rate)
+
+    def _open_position(self, signal, raw_open: float, when, portfolio: PortfolioState, symbol: str):
+        params = signal.trade_params
+        if params is None:
+            return None
+        side = "buy" if signal.signal_type == SignalType.LONG else "sell"
+        fill = self._slip_entry(side, raw_open)
+        qty = params.quantity
+        entry_fee = qty * fill * self.commission_rate
+        portfolio.current_capital -= entry_fee
+        position = {
+            "side": side,
+            "entry_price": fill,
+            "entry_time": when,
+            "quantity": qty,
+            "stop_loss": params.stop_loss,
+            "take_profit": params.take_profit,
+            "value_usd": qty * fill,
+        }
+        portfolio.open_positions[symbol] = position
+        return position
 
 
 def parse_args():

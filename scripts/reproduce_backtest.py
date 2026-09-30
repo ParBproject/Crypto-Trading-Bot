@@ -35,7 +35,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from backtest import BacktestEngine  # noqa: E402
+from backtest import BacktestEngine, buy_and_hold_final_capital  # noqa: E402
 from src.bot import load_config  # noqa: E402
 from src.data_fetcher import IndicatorCalculator  # noqa: E402
 
@@ -67,12 +67,43 @@ def load_sample(path: Path) -> pd.DataFrame:
     return df
 
 
-def buy_and_hold_equity(close: pd.Series, capital: float) -> pd.Series:
-    """Scale a long-only hold of the test-window close to ``capital``."""
-    base = float(close.iloc[0])
-    if base <= 0:
-        raise ValueError("Test-window close is not positive.")
-    return capital * (close / base)
+def buy_and_hold_equity(
+    test_df: pd.DataFrame,
+    capital: float,
+    commission_rate: float,
+    slippage_rate: float,
+    seq_len: int,
+) -> pd.Series:
+    """Fully invested long on the engine's entry bar, with the same costs.
+
+    Entry is the open of the first bar a signal can fill (``seq_len`` bars
+    into the test window). Each later point is that position liquidated at
+    the bar's close, so the last point matches ``buy_and_hold_final_capital``.
+    """
+    entry_i = seq_len if seq_len < len(test_df) else 0
+    entry_open = float(test_df["open"].iloc[entry_i])
+    final = buy_and_hold_final_capital(
+        capital,
+        entry_open,
+        float(test_df["close"].iloc[-1]),
+        commission_rate,
+        slippage_rate,
+    )
+    entry = entry_open * (1 + slippage_rate)
+    if capital <= 0 or entry <= 0:
+        return pd.Series(float(capital), index=test_df.index, name="buy_and_hold")
+    qty = capital / (entry * (1 + commission_rate))
+    values = []
+    last = len(test_df) - 1
+    for i, close in enumerate(test_df["close"].astype(float)):
+        if i < entry_i:
+            values.append(float(capital))
+        elif i == last:
+            values.append(float(final))
+        else:
+            exit_fill = max(0.0, float(close) * (1 - slippage_rate))
+            values.append(qty * exit_fill * (1 - commission_rate))
+    return pd.Series(values, index=test_df.index, name="buy_and_hold")
 
 
 def style_ax(ax, title: str, ylabel: str) -> None:
@@ -103,20 +134,21 @@ def plot_equity(
     fig, ax = plt.subplots(figsize=(11.2, 5.4), facecolor=BG)
     style_ax(
         ax,
-        f"Realized equity {strategy_return:+.2f}% vs buy-and-hold {bh_return:+.2f}%",
+        f"Mark-to-market equity {strategy_return:+.2f}% vs buy-and-hold {bh_return:+.2f}%",
         "USD",
     )
     ax.plot(benchmark.index, benchmark.values, color=BLUE, linewidth=1.3, label="Buy and hold")
-    ax.plot(equity.index, equity.values, color=EMERALD, linewidth=2.0, label="Strategy (realized)")
+    ax.plot(equity.index, equity.values, color=EMERALD, linewidth=2.0, label="Strategy")
     ax.axhline(INITIAL_CAPITAL, color=MUTED, linewidth=0.8, linestyle="--", label="Starting capital")
-    ax.text(
-        0.02,
-        0.08,
-        "No round trips, so realized equity stays at $10,000.",
-        transform=ax.transAxes,
-        color=EMERALD,
-        fontsize=10,
-    )
+    if float(equity.iloc[-1]) == INITIAL_CAPITAL and float(equity.max()) == float(equity.min()):
+        ax.text(
+            0.02,
+            0.08,
+            "No round trips, so equity stays at $10,000.",
+            transform=ax.transAxes,
+            color=EMERALD,
+            fontsize=10,
+        )
     ax.legend(facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, fontsize=9)
     save_fig(fig, path)
 
@@ -228,8 +260,21 @@ def main() -> None:
 
     split_idx = int(len(enriched) * 0.70)
     test_df = enriched.iloc[split_idx:]
-    benchmark = buy_and_hold_equity(test_df["close"], INITIAL_CAPITAL)
-    bh_return = (float(benchmark.iloc[-1]) / INITIAL_CAPITAL - 1) * 100
+    seq_len = int(config.get("model", {}).get("sequence_length", 60))
+    benchmark = buy_and_hold_equity(
+        test_df,
+        INITIAL_CAPITAL,
+        engine.commission_rate,
+        engine.slippage_rate,
+        seq_len,
+    )
+    bh_final = float(metrics["buy_hold_final_capital_usd"])
+    if abs(float(benchmark.iloc[-1]) - bh_final) > 0.02:
+        raise SystemExit(
+            f"Buy-and-hold chart ends at {float(benchmark.iloc[-1]):.2f}, "
+            f"engine reports {bh_final:.2f}."
+        )
+    bh_return = float(metrics["buy_hold_return_pct"])
 
     equity = pd.Series(
         [point[1] for point in metrics["equity_curve"]],
@@ -246,23 +291,28 @@ def main() -> None:
     published = {k: v for k, v in metrics.items() if k not in {"trades", "equity_curve"}}
     if isinstance(published.get("profit_factor"), float) and not np.isfinite(published["profit_factor"]):
         published["profit_factor"] = None
-    published["buy_and_hold_return_pct"] = round(bh_return, 2)
-    published["buy_and_hold_final_usd"] = round(float(benchmark.iloc[-1]), 2)
+    entry_i = seq_len if seq_len < len(test_df) else 0
+    published["buy_and_hold_return_pct"] = metrics["buy_hold_return_pct"]
+    published["buy_and_hold_final_usd"] = metrics["buy_hold_final_capital_usd"]
     published["test_start_close"] = round(float(test_df["close"].iloc[0]), 2)
     published["test_end_close"] = round(float(test_df["close"].iloc[-1]), 2)
+    published["buy_hold_entry_time"] = test_df.index[entry_i].strftime("%Y-%m-%d %H:%M:%S%z")
+    published["buy_hold_entry_open"] = round(float(test_df["open"].iloc[entry_i]), 2)
     published["sample_file"] = str(SAMPLE_CSV.relative_to(ROOT))
     published["sample_rows"] = int(len(raw))
     published["sample_start"] = raw.index[0].strftime("%Y-%m-%d %H:%M:%S%z")
     published["sample_end"] = raw.index[-1].strftime("%Y-%m-%d %H:%M:%S%z")
     published["ml_enabled"] = False
-    published["equity_mark_to_market"] = False
+    published["equity_mark_to_market"] = True
     published["ta_gates"] = gates
     published["hourly_moves"] = hourly
     published["notes"] = (
-        "Strategy return is realized equity from BacktestEngine with use_ml=False. "
-        "Open positions are not marked to market between fills. "
-        "Buy-and-hold is the test-window close scaled to the same starting capital. "
-        "Sortino is 0 when fewer than two equity returns are negative."
+        "Strategy equity is mark-to-market from BacktestEngine with use_ml=False. "
+        "A signal at the close fills at the next bar's open. "
+        "Buy-and-hold is the engine's fully invested long from that first fillable "
+        "open through the last close, with the same commission and slippage. "
+        "Sortino is 0 when fewer than two equity returns are negative. "
+        "Sharpe and Sortino use the median bar spacing."
     )
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

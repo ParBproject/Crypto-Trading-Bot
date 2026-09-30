@@ -20,7 +20,7 @@ trading:
   base_currency: "USDT"
   timeframe: "1h"          # 1m, 5m, 15m, 1h, 4h, 1d
   loop_interval_sec: 60    # How often the main loop fires
-  mode: "paper"            # paper | live | backtest
+  mode: "paper"            # paper | live | backtest. Live also needs ALLOW_LIVE_TRADING=1.
 
 # ─── Data ────────────────────────────────────────────────────
 data:
@@ -40,6 +40,7 @@ model:
   early_stopping_patience: 10
   learning_rate: 0.001
   model_dir: "models/"
+  seed: 42                 # Fixed so a training rerun starts from the same weights
   retrain_interval_hours: 24  # Retrain every N hours
 
 # ─── Strategy ────────────────────────────────────────────────
@@ -88,5 +89,5 @@ backtest:
   start_date: "2023-01-01"
   end_date: "2024-01-01"
   initial_capital: 10000.0
-  commission_pct: 0.1      # 0.1% per fill (entry and exit each charged once)
-  slippage_pct: 0.05       # Simulated slippage
+  commission_pct: 0.1      # percent per fill; 0.1 means 0.1%, charged on entry and on exit
+  slippage_pct: 0.05       # percent; 0.05 means 0.05%, adverse on each fill

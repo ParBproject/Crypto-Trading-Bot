@@ -2,6 +2,9 @@
 # Crypto Trading Bot — Python Dependencies
 # Python >= 3.10 required
 # Install: pip install -r requirements.txt
+#
+# CI installs the pinned set in requirements-dev.txt and runs pytest.
+# Model training uses config.model.seed (default 42).
 # ============================================================
 
 # ─── Exchange & Market Data ──────────────────────────────────

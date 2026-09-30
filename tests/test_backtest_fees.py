@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-from backtest import BacktestEngine, commission_rate_from_config
+from backtest import BacktestEngine, commission_rate_from_config, slippage_rate_from_config
 from src.risk_manager import TradeParameters
 from src.strategy import SignalSource, SignalType, StrategyEngine, TradeSignal
 
@@ -96,7 +96,7 @@ def test_long_round_trip_charges_entry_and_exit_once(monkeypatch):
     }
     engine, metrics = _run(monkeypatch, config, ["long", "exit"])
 
-    slip = BacktestEngine.SLIPPAGE_PCT
+    slip = slippage_rate_from_config(config)
     rate = 0.01
     entry = 100.0 * (1 + slip)
     exit_px = 100.0 * (1 - slip)
@@ -123,7 +123,7 @@ def test_short_round_trip_charges_entry_and_exit_once(monkeypatch):
     }
     _engine, metrics = _run(monkeypatch, config, ["short", "exit"])
 
-    slip = BacktestEngine.SLIPPAGE_PCT
+    slip = slippage_rate_from_config(config)
     rate = 0.001
     entry = 100.0 * (1 - slip)
     exit_px = 100.0 * (1 + slip)
@@ -161,10 +161,10 @@ def test_end_of_backtest_close_charges_exit_fee_once(monkeypatch):
     engine = BacktestEngine(config, initial_capital=10_000.0)
     metrics = engine.run(SYMBOL, frame, use_ml=False)
 
-    slip = BacktestEngine.SLIPPAGE_PCT
+    slip = slippage_rate_from_config(config)
     rate = engine.commission_rate
     entry = 100.0 * (1 + slip)
-    exit_px = 100.0
+    exit_px = 100.0 * (1 - slip)
     entry_fee = entry * rate
     exit_fee = exit_px * rate
     pnl = (exit_px - entry) - exit_fee
